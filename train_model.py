@@ -14,7 +14,7 @@ import time
 import argparse
 import sys
 import random
-from evaluate_model import accu
+from evaluate_model import new_accuracy,sample_val_data
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -84,8 +84,6 @@ def save_variables_and_metagraph(sess, saver, model_dir, model_name, step):
     checkpoint_path = os.path.join(model_dir, 'model-%s.ckpt' % model_name)
     saver.save(sess, checkpoint_path, global_step=step, write_meta_graph=False)
     metagraph_filename = os.path.join(model_dir, 'model-%s.meta' % model_name)
-    if not os.path.exists(metagraph_filename):
-        saver.export_meta_graph(metagraph_filename)
 
 def msml_loss(anchor ,pos, neg1 , neg2, alpha):
 
@@ -123,7 +121,6 @@ def main(args):
             for filename in tf.unstack(filenames):
                 file_contents = tf.read_file(filename)
                 image = tf.image.decode_image(file_contents, channels=3)
-                #image.set_shape((args.image_size,args.image_size,args.channel))
                 image.set_shape([None, None, None])
                 image = tf.image.resize_images(image, (args.image_size,args.image_size),method=1)
 
@@ -140,8 +137,6 @@ def main(args):
         image_batch = tf.identity(image_batch, 'image_batch')
         image_batch = tf.identity(image_batch, 'input')
 
-
-        #推理graph
         prelogits= network.inference(image_batch, args.keep_probability,
                                          phase_train=phase_train_placeholder,
                                          bottleneck_layer_size=args.embedding_size,
@@ -150,19 +145,14 @@ def main(args):
         embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings') #l2归一化
         anchor, pos, neg1, neg2 = tf.unstack(tf.reshape(embeddings, [-1,4,args.embedding_size]),4,1) # 获取apn
 
-        #anchor, pos,neg = tf.unstack(tf.reshape(embeddings, [-1,3,args.embedding_size]),3,1)
-
-        #loss = triplet_loss(anchor,pos,neg, args.alpha)
         msml_loss_ = msml_loss(anchor, pos, neg1, neg2, args.alpha)
-        # 采用指数衰减学习率
+
         learning_rate = tf.train.exponential_decay(learning_rate_placeholder, global_step,
                                                    args.decay_steps, args.decay_rate, staircase=True)
 
         regularization_loss = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
         total_loss = tf.add_n([msml_loss_] + regularization_loss, name='total_loss') # 加上正则项的loss
-        #total_loss = tf.add_n([loss] + regularization_loss, name='total_loss') # 加上正则项的loss
 
-        # 建立计算图，用以训练一个batch的数据，并更新参数
         train_op = train_(total_loss, global_step, learning_rate,
                           args.moving_average_decay, tf.global_variables())
 
@@ -171,30 +161,29 @@ def main(args):
         sess = tf.Session()
         sess.run(tf.global_variables_initializer())
         sess.run(tf.local_variables_initializer())
+
         with sess.as_default():
             coord = tf.train.Coordinator()
             threads = tf.train.start_queue_runners(coord=coord, sess=sess)
             epoch = 0
-            while epoch < args.max_epoch: #将所有数据过一遍的次数
-                step = sess.run(global_step)
+            val_data, val_label, img_num_same, img_num_diff = sample_val_data('/Users/lees/Desktop/siamese_network/img1')
+            ckpt = tf.train.get_checkpoint_state('/Users/lees/Desktop/model')
+            if ckpt and ckpt.model_checkpoint_path:  # 判断ckpt是否为空，若不为空，才进行模型的加载，否则从头开始训练
+                saver.restore(sess, tf.train.latest_checkpoint('/Users/lees/Desktop/model'))
+                print('exits, now reload model: %s' % ckpt)
+            while epoch < args.max_epoch:
                 print('epoch: %d' %epoch)
-                # train1(args, sess, args.batch_size, args.person_per_batch, args.images_per_person, enqueue_op,
-                #        image_paths_placeholder, args.embedding_size, embeddings,
-                #        batch_size_placeholder, phase_train_placeholder, train_op, args.epoch_size, args.alpha,
-                #        loss, global_step, learning_rate_placeholder, learning_rate)
                 train2(args,sess, args.batch_size,args.person_per_batch, args.images_per_person,enqueue_op,
-                image_paths_placeholder,args.embedding_size,embeddings,
-                batch_size_placeholder, phase_train_placeholder,train_op,args.epoch_size,args.alpha,total_loss,global_step,
-                      learning_rate_placeholder,learning_rate)
+                        image_paths_placeholder,args.embedding_size,embeddings,
+                        batch_size_placeholder, phase_train_placeholder,train_op,args.epoch_size,args.alpha,total_loss,global_step,
+                          learning_rate_placeholder,learning_rate)
                 epoch += 1
                 subdir = time.strftime('%Y%m%d-%H%M%S', time.localtime())
-                save_variables_and_metagraph(sess, saver, model_save_dir, subdir, step)
-                accu(subdir)
+                saver.save(sess, '/Users/lees/Desktop/model/{}'.format(subdir))
+                new_accuracy(val_data, val_label,img_num_same,img_num_diff)
                 print('Model saved at %s' % model_save_dir)
-            sess.close()
-        coord.request_stop()
-        coord.join(threads)
-    return model_save_dir
+            coord.request_stop()
+            coord.join(threads)
 
 
 def _add_loss_summaries(total_loss):
@@ -207,7 +196,6 @@ def _add_loss_summaries(total_loss):
     Returns:
       loss_averages_op: op for generating moving averages of losses.
     """
-    # Compute the moving average of all individual losses and the total loss.
     loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
     losses = tf.get_collection('losses')
     loss_averages_op = loss_averages.apply(losses + [total_loss])
@@ -290,15 +278,14 @@ def train2(args,sess, batch_size, person_per_batch,images_per_person,enqueue_op,
           loss,global_step,learning_rate_placeholder,learning_rate):
 
     batch_number = 0
-    lr = args.learning_rate
     err = 0.0
     step = 0
     l = 0.0
+    lr = args.learning_rate
     while batch_number < epoch_size:  #一个epoch有多少组subepoch
         print('batch_number:%d' %batch_number)
         train_set = get_dataset('~/Desktop/siamese_network/img/lfw')
         image_paths, num_per_class= sample_person(train_set, person_per_batch, images_per_person) #随机选取一些图片用以下次训练 3
-        #print('sample dataset done')
 
         #evaluate_model(sess, enqueue_op, image_paths_placeholder, embeddings,phase_train_placeholder,batch_size_placeholder)
         n_example = person_per_batch * images_per_person # 50 x 40
@@ -306,7 +293,7 @@ def train2(args,sess, batch_size, person_per_batch,images_per_person,enqueue_op,
         image_paths_array = np.reshape(np.expand_dims(np.array(image_paths), 1), (-1, 4))
         sess.run(enqueue_op, {image_paths_placeholder: image_paths_array})
         emb_array_for_select = np.zeros((n_example, embedding_size)) # 146 x 8 x 128 embedding_size是一幅图像映射出来的特征数，用来放一个n_example的所有图片经过network后的feature map
-        nrof_batches = int(np.round(n_example / batch_size))-1 #1152张图片，8，一共有 144 x 8 / 8 个batch 144
+        nrof_batches = int(np.round(n_example / batch_size))-1 # 1152张图片，8，一共有 144 x 8 / 8 个batch 144
 
         for i in xrange(nrof_batches):
             n_batch_size = min(n_example-i*batch_size, batch_size)
@@ -318,14 +305,12 @@ def train2(args,sess, batch_size, person_per_batch,images_per_person,enqueue_op,
         # triplets, nrof_random_negs, nrof_triplets = select_triplets(emb_array_for_select, num_per_class,class_per_img_array,
         #                                                             image_paths, person_per_batch,alpha)
         msml, n_msml = select_msml(emb_array_for_select, num_per_class,image_paths, person_per_batch,alpha)
-        #print('select msml done')
         nrof_batches1 = int(np.round(n_msml/ batch_size)) # batch_size = 15
         msml_paths = list(itertools.chain(*msml)) #将每个triplets的图片路径链接起来
 
         msml_paths_array = np.reshape(np.expand_dims(np.array(msml_paths), 1), (-1, 4)) #组成一个个triplet，再构成一个整个列表
         sess.run(enqueue_op, {image_paths_placeholder: msml_paths_array}) #triplet入队
         i=0
-        #print('start train...')
 
         while i < nrof_batches1:
 
@@ -336,9 +321,9 @@ def train2(args,sess, batch_size, person_per_batch,images_per_person,enqueue_op,
         print('loss: %.9f, step: %d, learning_rate: %.9f' % (err,step,l))
 
         batch_number += 1
-        #print('training done')
     return
-
+def conti_train():
+    pass
 def select_msml(embeddings, nrof_images_per_class,image_paths, person_per_batch, alpha):
     emb_start_idx = 0
     num_ = 0
@@ -430,9 +415,9 @@ def parse(argv):
     parser.add_argument('--max_epoch',type=int,
                         help='max_epoch',default=50)
     parser.add_argument('--epoch_size', type=int,
-                        help='Number of batches per epoch', default=8)
+                        help='Number of batches per epoch', default=10)
     parser.add_argument('--keep_probability', type=int,
-                        help='params keep_probability', default=0.6)
+                        help='params keep_probability', default=0.5)
     parser.add_argument('--batch_size', type=int,
                         help='Number of images to process in a batch', default=15)
     parser.add_argument('--embedding_size', type=int,
@@ -452,11 +437,11 @@ def parse(argv):
     parser.add_argument('--channel', type=int,
                         help='Input images channel.', default=3)
     parser.add_argument('--learning_rate',type=float,
-                         help='learning_rate', default=0.00012)
+                         help='learning_rate', default=9e-5)
     parser.add_argument('--decay_rate', type=float,
-                        help='decay_rate', default=0.9)
+                        help='decay_rate', default=0.8)
     parser.add_argument('--decay_steps', type=int,
-                        help='decay_steps', default=2000)
+                        help='decay_steps', default=6000)
     return parser.parse_args(argv)
 
 
